@@ -223,6 +223,14 @@ LLM_MAX_RETRIES = env.int(
 # A website is "stale" when its last successful sync is older than this.
 STALE_AFTER_HOURS = env.float("STALE_AFTER_HOURS", default=24.0)
 
+# Meaning-based search for requests the keyword filter cannot place.
+# Only products within SEMANTIC_MARGIN (cosine distance) of the closest one are
+# kept, at most SEMANTIC_FALLBACK_LIMIT of them. SEMANTIC_MAX_DISTANCE is an
+# optional absolute ceiling (0 = off); tune it with `manage.py semantic_probe`.
+SEMANTIC_MARGIN = env.float("SEMANTIC_MARGIN", default=0.08)
+SEMANTIC_MAX_DISTANCE = env.float("SEMANTIC_MAX_DISTANCE", default=0.0)
+SEMANTIC_FALLBACK_LIMIT = env.int("SEMANTIC_FALLBACK_LIMIT", default=5)
+
 # Chat request rate limit per client (DRF throttle rate syntax).
 CHAT_RATE_LIMIT = env("CHAT_RATE_LIMIT", default="30/min")
 

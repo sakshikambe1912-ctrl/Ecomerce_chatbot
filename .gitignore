@@ -1,18 +1,48 @@
-# Secrets and local environment
-.env
+# Python cache files
+
+**pycache**/
+*.py[cod]
+*.pyo
+
+# Python virtual environments
+
 .venv/
+venv/
+env/
 
-# Python caches
-__pycache__/
-*.pyc
+# Environment variables and secrets
 
-# Local databases
-db.sqlite3
+.env
+.env.*
+!.env.example
 
-# Frontend build output and dependencies
-node_modules/
-frontend/dist/
+# Django generated files
 
-# Editor and logs
-.vscode/
+staticfiles/
+media/
 *.log
+
+# Local databases and database backups
+
+*.sqlite3
+*.db
+*.dump
+*.bak
+
+# Test and coverage files
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and operating system files
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+
+*.tmp
+*.temp

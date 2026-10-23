@@ -1,4 +1,5 @@
 import json
+import re
 
 from assistant.services.llm_service import LLMService, call_llm
 
@@ -9,12 +10,32 @@ from assistant.services.llm_service import LLMService, call_llm
 MAX_PRODUCTS_IN_PROMPT = 8
 
 
+# "Product link: N/A", "Product link:" and similar lines carry no information.
+_EMPTY_LINK_LINE = re.compile(
+    r"^\s*[-*]?\s*(?:\*\*)?(?:product\s+)?(?:link|url)(?:\*\*)?\s*:\s*"
+    r"(?:\*\*)?\s*(?:n/?a|none|not (?:provided|available)|unavailable|null|-|\[.*?\])?\s*(?:\*\*)?\s*$",
+    re.IGNORECASE,
+)
+_EMPTY_FIELD_LINE = re.compile(
+    r"^\s*[-*]?\s*(?:\*\*)?(?:brand|rating)(?:\*\*)?\s*:\s*(?:n/?a|none|null|-)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_empty_lines(text):
+    """Drop 'Product link: [Not provided]' style lines. A real URL on the line is kept."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not _EMPTY_LINK_LINE.match(line) and not _EMPTY_FIELD_LINE.match(line)
+    )
+
+
 class GroundedResponseService:
 
     def __init__(self):
         self.llm_service = LLMService()
 
-    def generate_answer(self, user_message, products):
+    def generate_answer(self, user_message, products, uncertain=False):
 
         # Do not invent recommendations when no products match.
         if not products:
@@ -29,7 +50,7 @@ class GroundedResponseService:
         product_context = []
 
         for product in products[:MAX_PRODUCTS_IN_PROMPT]:
-            product_context.append({
+            record = {
                 "id": product.get("id"),
                 "website_name": product.get("website_name"),
                 "title": product.get("title"),
@@ -38,11 +59,27 @@ class GroundedResponseService:
                 "price": product.get("price"),
                 "currency": product.get("currency"),
                 "rating": product.get("rating"),
-                "is_available": product.get("is_available"),
+                "availability": (
+                    "in stock" if product.get("is_available") else "out of stock"
+                ),
                 "product_url": product.get("product_url"),
+                "description": (product.get("description") or "")[:300],
                 "features": product.get("features"),
                 "specifications": product.get("specifications"),
-            })
+            }
+            # Leave out empty fields so the model has nothing to fill in with guesses.
+            product_context.append(
+                {k: v for k, v in record.items() if v not in (None, "", [], {})}
+            )
+
+        closest_note = ""
+        if uncertain:
+            closest_note = (
+                "\nNOTE: These records are only the closest matches by meaning and may "
+                "not fit the request. Mention a product only if it really fits what "
+                "the user asked for. If none fits, say plainly that the catalog has no "
+                "such product and recommend nothing.\n"
+            )
 
         prompt = f"""
 You are EcommerceAI, an intelligent shopping assistant.
@@ -54,7 +91,7 @@ USER QUESTION:
 
 PRODUCT RECORDS:
 {json.dumps(product_context, ensure_ascii=True, default=str)}
-
+{closest_note}
 STRICT RULES:
 
 1. Recommend only products in the supplied records.
@@ -70,10 +107,19 @@ STRICT RULES:
 10. Use ordinary spaces and standard ASCII punctuation where possible.
 11. Do not use unusual Unicode spacing characters.
 12. Keep the answer concise and easy to read.
+13. Answer only what the user asked. Do not add unrelated products,
+    facts or suggestions.
+14. If the user asks for a type of product (for example shoes), mention
+    only supplied records of that type and ignore the rest.
+15. If the supplied records do not contain the answer, say so plainly
+    instead of guessing.
 
 FORMAT:
 
-For each recommended product, use this structure:
+If the user asks about one detail of a product (its price, battery life,
+availability, a feature), answer it directly in one to three sentences using
+only the supplied records, without the structure below. If the user is
+asking for products, then for each matching product use this structure:
 
 **Product Name**
 
@@ -82,7 +128,7 @@ For each recommended product, use this structure:
 - Rating: [rating, if available]
 - Availability: [available or unavailable, if known]
 - Why it matches: [brief explanation based on supplied facts]
-- Product link: [URL, only if available]
+- Product link: [URL] (leave this line out completely if no URL is supplied)
 
 After the product details, provide a brief summary.
 
@@ -132,4 +178,4 @@ IMPORTANT:
             .replace("\u2009", " ")
         )
 
-        return answer.strip()
+        return strip_empty_lines(answer).strip()

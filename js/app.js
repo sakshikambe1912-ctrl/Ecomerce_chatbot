@@ -648,4 +648,12 @@ document.addEventListener('DOMContentLoaded', () => {
   renderDeals();
   renderProducts();
   updateCartBadge();
+
+    // Open a product's quick view from a link such as index.html#product-2
+  function openFromHash() {
+    const m = location.hash.match(/^#product-(\d+)$/);
+    if (m) window.openQuickView(parseInt(m[1], 10));
+  }
+  openFromHash();
+  window.addEventListener('hashchange', openFromHash);
 });

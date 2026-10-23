@@ -31,16 +31,23 @@ from assistant.services.comparison_service import (
     mentions_compared_product,
     render_comparison,
 )
+from assistant.services.conversation_context import is_follow_up, is_listing_request, might_follow_up
 from assistant.services.currency_policy import currency_from_reply, decide_currency
 from assistant.services.grounded_response_service import GroundedResponseService
 from assistant.services.hybrid_search_service import HybridSearchService
-from assistant.services.product_search_service import ProductSearchService
+from assistant.services.product_lookup import facts_answer, find_named_products
+from assistant.services.product_search_service import (
+    ProductSearchService,
+    category_matches,
+    searchable_fields,
+)
 from assistant.services.requirements_service import RequirementsService, ShoppingRequirements
 from assistant.services.scope_guard import GREETING_REPLY, OUT_OF_SCOPE_REPLY
 from assistant.services.search_diagnostics import build_no_match_message
 from assistant.services.scope_guard import check as scope_check
 from assistant.services.shopping_advice_service import ShoppingAdviceService
 from conversations.models import Conversation, Message
+from products.models import Product
 from websites.models import Website
 
 logger = logging.getLogger(__name__)
@@ -50,7 +57,29 @@ SEARCH_LIMIT = 20
 # Alternatives are looked for only when fewer matches than this were found.
 ALTERNATIVES_BELOW = 3
 SHOPPING_INTENTS = ("product_search", "product_comparison")
+# At most this many product cards are shown under one answer.
+MAX_CARDS = 8
 SEMANTIC_UNAVAILABLE_NOTICE = "Semantic ranking was unavailable; results use standard ranking."
+
+
+def _products_named_in_answer(answer, products):
+    """Products whose name (first three words of the title) appears in the answer."""
+    text = (answer or "").lower()
+    named = []
+    for product in products:
+        key = " ".join((product.get("title") or "").lower().split()[:3])
+        if key and key in text:
+            named.append(product)
+    return named
+
+
+def _has_hard_limits(requirements):
+    return any([
+        requirements.min_price is not None,
+        requirements.max_price is not None,
+        requirements.min_rating is not None,
+        requirements.must_have_features,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +198,21 @@ class ChatOrchestrator:
         # The previous turn asked which currency to use; a reply that names one
         # of the offered currencies resumes that search without a model call.
         chosen = currency_from_reply(message, options) if pending == "currency" else None
+        follow_up = False
         if chosen:
             requirements = ShoppingRequirements.model_validate({**previous, "currency": chosen})
+            follow_up = True
         else:
-            requirements = self._extract(message, history, previous)
+            requirements, follow_up = self._extract(message, history, previous)
+        requirements = self._trust_catalog(requirements, website_ids)
 
         # Neither general questions nor out-of-scope requests change memory.
+        if requirements.intent in ("general_question", "clarification_needed"):
+            # A question about a product the user names is answered from the catalog.
+            exact, loose = find_named_products(message, website_ids)
+            if exact or loose:
+                return self._answer_about(message, exact or loose, requirements)
+
         if requirements.intent == "general_question":
             return ChatResult(
                 message=message,
@@ -209,15 +247,39 @@ class ChatOrchestrator:
             requirements = requirements.model_copy(update={"currency": decision.currency})
 
         hybrid = HybridSearchService()
-        products = hybrid.search(
-            requirements=requirements,
-            website_ids=website_ids,
-            limit=SEARCH_LIMIT,
-        )
+        products = None
+        uncertain = False
+
+        # Comparing products the user names: use exactly those products.
+        if is_comparison_request(requirements, message):
+            exact, _ = find_named_products(message, website_ids)
+            if len(exact) >= 2:
+                products = exact
+
+        if products is None:
+            # The user's own words guide the meaning-based part, except in follow-ups
+            # ("increase my budget") and whole-catalog requests ("products under $50").
+            query_text = None if (follow_up or is_listing_request(message)) else message
+            products = hybrid.search(
+                requirements=requirements,
+                website_ids=website_ids,
+                limit=SEARCH_LIMIT,
+                query_text=query_text,
+            )
+            uncertain = hybrid.mode == "semantic"
+
+            # Nothing found and no budget/rating limit to blame: the user may have
+            # named a product the keyword search could not place.
+            if not products and not _has_hard_limits(requirements):
+                exact, loose = find_named_products(message, website_ids)
+                if exact or loose:
+                    return self._answer_about(message, exact or loose, requirements)
+
         notices = []
         if not hybrid.semantic_available:
             notices.append(SEMANTIC_UNAVAILABLE_NOTICE)
 
+        cards = products[:MAX_CARDS]
         comparison = None
         if products and is_comparison_request(requirements, message):
             comparison = build_comparison(products, stale_ids)
@@ -225,11 +287,17 @@ class ChatOrchestrator:
         if comparison:
             answer = self._explain_comparison(message, comparison, products, requirements)
         elif products:
-            answer = GroundedResponseService().generate_answer(user_message=message, products=products)
+            answer = GroundedResponseService().generate_answer(
+                user_message=message, products=products, uncertain=uncertain,
+            )
             # Any price, rating or URL the records do not support -> template answer.
             answer, valid = validate_answer(answer, products, requirements)
             if not valid:
                 logger.warning("Generated answer contained unsupported values; used the template answer.")
+            # Cards: the products the answer is about. For closest-by-meaning results
+            # that is only the ones the answer recommends (possibly none).
+            named = _products_named_in_answer(answer, products)
+            cards = named if (named or uncertain) else products[:MAX_CARDS]
         else:
             # Deterministic explanation; no model call and no non-matching products.
             stages = ProductSearchService().diagnose(requirements, website_ids)
@@ -247,7 +315,7 @@ class ChatOrchestrator:
             intent=requirements.intent,
             answer=answer,
             requirements=requirements_json,
-            products=products,
+            products=cards,
             alternatives=alternatives,
             comparison=comparison,
             notices=notices,
@@ -268,18 +336,55 @@ class ChatOrchestrator:
         return render_comparison(comparison)
 
     def _extract(self, message, history, previous):
+        """Returns (requirements, follow_up). Memory is merged only for real follow-ups."""
         requirements_service = RequirementsService()
+        # The earlier conversation is shown to the model only when it could matter.
+        seen_history = history if (previous and might_follow_up(message)) else []
         requirements = requirements_service.extract(
             user_message=message,
-            conversation_history=history,
+            conversation_history=seen_history,
         )
-        if previous:
+        follow_up = is_follow_up(message, requirements, previous)
+        if follow_up:
             requirements = requirements_service.merge_requirements(
                 previous_requirements=previous,
                 new_requirements=requirements,
                 user_message=message,
             )
-        return requirements
+        return requirements, follow_up
+
+    @staticmethod
+    def _trust_catalog(requirements, website_ids):
+        """A product type the model invented ("home_appliances") is dropped, not enforced."""
+        category = (requirements.category or "").strip()
+        if not category:
+            return requirements
+        products = Product.objects.filter(website_id__in=website_ids, website__is_active=True)
+        for product in products.iterator():
+            if category_matches(searchable_fields(product), category):
+                return requirements
+        return requirements.model_copy(update={"category": None})
+
+    @staticmethod
+    def _answer_about(message, products, requirements):
+        """Answer a question about specific, named catalog products."""
+        requirements_json = requirements.model_dump(mode="json")
+        if len(products) == 1:
+            facts = facts_answer(message, products[0])
+            if facts:
+                return ChatResult(
+                    message=message, intent="product_search", answer=facts,
+                    requirements=requirements_json, products=products,
+                )
+        answer = GroundedResponseService().generate_answer(user_message=message, products=products)
+        answer, valid = validate_answer(answer, products, requirements)
+        if not valid:
+            logger.warning("Generated answer contained unsupported values; used the template answer.")
+        cards = _products_named_in_answer(answer, products) or products[:MAX_CARDS]
+        return ChatResult(
+            message=message, intent="product_search", answer=answer,
+            requirements=requirements_json, products=cards,
+        )
 
     # -- saving --------------------------------------------------------------
 

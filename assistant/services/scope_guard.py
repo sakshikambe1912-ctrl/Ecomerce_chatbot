@@ -52,7 +52,9 @@ def is_out_of_scope(message):
 
 
 def is_greeting(message):
-    normalized = re.sub(r"\s+", " ", message).strip(" .!?,").lower()
+    # Quotation marks around the message ("Hello") must not hide a greeting.
+    cleaned = re.sub(r"[\"'\u201c\u201d\u2018\u2019`]+", "", message)
+    normalized = re.sub(r"\s+", " ", cleaned).strip(" .!?,").lower()
     return bool(_GREETING.fullmatch(normalized)) or normalized in (
         "what can you do", "what can you help me with", "who are you",
     )

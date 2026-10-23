@@ -12,6 +12,44 @@ def _word_pattern(text):
     return re.compile(r"(?<![a-z0-9])" + re.escape(text.strip().lower()) + r"(?![a-z0-9])")
 
 
+# Filler words that must never decide whether a product matches.
+KEYWORD_STOPWORDS = {
+    "show", "me", "find", "get", "give", "search", "looking", "look", "for",
+    "want", "need", "buy", "suggest", "recommend", "please", "some", "any",
+    "a", "an", "the", "i", "my", "to", "of", "and", "or", "with", "in", "on",
+    "do", "you", "have", "sell", "is", "there", "are", "something", "can",
+}
+
+
+def _singular(word):
+    """Very small singular form: shoes -> shoe, watches -> watch, batteries -> battery."""
+    word = word.strip().lower()
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith(("ches", "shes", "xes", "sses", "zes")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _variants(term):
+    """The term and its singular form (the singular also matches the plural in text)."""
+    term = term.strip().lower()
+    return list(dict.fromkeys([term, " ".join(_singular(w) for w in term.split())]))
+
+
+def _plural_word_pattern(word):
+    """Whole word, optionally plural: 'shoe' matches 'shoe', 'shoes'."""
+    base = re.escape(_singular(word))
+    return re.compile(r"(?<![a-z0-9])" + base + r"(?:s|es)?(?![a-z0-9])")
+
+
+def _feature_key(feature):
+    """'noise_cancellation' and 'noise-cancellation' both become 'noise cancellation'."""
+    return re.sub(r"[_\-\s]+", " ", feature.strip().lower())
+
+
 def brand_matches(product, requested):
     """
     Brand rule (case-insensitive, whole word):
@@ -162,8 +200,12 @@ def searchable_fields(product):
 
 def category_matches(fields, requested_category):
     """The requested product type may appear in the category, title, description or metadata."""
-    requested = requested_category.strip().lower()
-    return any(requested in fields[key] for key in ("category", "title", "description", "features", "specifications"))
+    keys = ("category", "title", "description", "features", "specifications")
+    return any(
+        variant in fields[key]
+        for variant in _variants(requested_category)
+        for key in keys
+    )
 
 
 def _alias_in(alias, text):
@@ -176,7 +218,10 @@ def _alias_in(alias, text):
 def features_match(fields, features):
     """Every requested feature (or one of its aliases) must appear in the product text."""
     return all(
-        any(_alias_in(alias, fields["text"]) for alias in FEATURE_ALIASES.get(feature, [feature]))
+        any(
+            _alias_in(alias, fields["text"])
+            for alias in FEATURE_ALIASES.get(_feature_key(feature), [_feature_key(feature)])
+        )
         for feature in features
     )
 
@@ -268,7 +313,7 @@ class ProductSearchService:
         ]
 
         features = [
-            feature.strip().lower()
+            _feature_key(feature)
             for feature in requirements.must_have_features
             if feature and feature.strip()
         ]
@@ -290,6 +335,7 @@ class ProductSearchService:
         # --------------------------------------------------
 
         scored_products = []
+        relevance_by_id = {}
 
         for product in products:
 
@@ -317,62 +363,58 @@ class ProductSearchService:
             # Initialize relevance score
             # ----------------------------------------------
 
-            score = 0
+            # `relevance` counts only real text matches. The rating bonus below
+            # is for ordering and must never make an unrelated product relevant.
+            relevance = 0
 
             # ----------------------------------------------
             # Keyword relevance
             # ----------------------------------------------
 
             for keyword in keywords:
+                variants = _variants(keyword)
 
-                if keyword in title:
-                    score += 5
+                if any(v in title for v in variants):
+                    relevance += 5
 
-                elif keyword in category:
-                    score += 4
+                elif any(v in category for v in variants):
+                    relevance += 4
 
-                elif keyword in brand:
-                    score += 3
+                elif any(v in brand for v in variants):
+                    relevance += 3
 
-                elif keyword in description:
-                    score += 2
+                elif any(v in description for v in variants):
+                    relevance += 2
 
-                elif keyword in product_text:
-                    score += 1
+                elif any(v in product_text for v in variants):
+                    relevance += 1
 
                 else:
-                    # Partial phrase match.
-                    words = keyword.split()
-
+                    # Partial phrase match on whole words, ignoring filler
+                    # words such as "show me".
+                    words = [
+                        w for w in keyword.split()
+                        if w not in KEYWORD_STOPWORDS and len(w) > 2
+                    ]
                     matched_words = sum(
                         1
                         for word in words
-                        if word in product_text
+                        if _plural_word_pattern(word).search(product_text)
                     )
-
                     if words:
-                        score += matched_words / len(words)
+                        relevance += matched_words / len(words)
 
-            # ----------------------------------------------
-            # Required feature relevance bonus
-            #
-            # Features have already been validated above.
-            # ----------------------------------------------
-
+            # Required features were validated above.
             if features:
-                score += 3 * len(features)
-
-            # ----------------------------------------------
-            # Category relevance bonus
-            # ----------------------------------------------
+                relevance += 3 * len(features)
 
             if category_match:
-                score += 4
+                relevance += 4
 
-            # ----------------------------------------------
-            # Rating bonus for relevance searches
-            # ----------------------------------------------
+            relevance_by_id[product.id] = relevance
+            score = relevance
 
+            # Rating bonus: ordering only.
             if (
                 requirements.sort_by == "relevance"
                 and product.rating is not None
@@ -389,7 +431,7 @@ class ProductSearchService:
             scored_products = [
                 (score, product)
                 for score, product in scored_products
-                if score > 0
+                if relevance_by_id.get(product.id, 0) > 0
             ]
 
         # --------------------------------------------------
@@ -466,7 +508,7 @@ class ProductSearchService:
             remaining = [product for product in remaining if keep(product)]
             stages.append((name, remaining))
 
-        features = [f.strip().lower() for f in requirements.must_have_features if f and f.strip()]
+        features = [_feature_key(f) for f in requirements.must_have_features if f and f.strip()]
 
         if requirements.category:
             stage("category", lambda p: category_matches(searchable_fields(p), requirements.category))
